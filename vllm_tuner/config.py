@@ -5,6 +5,16 @@ import yaml
 
 
 @dataclass
+class DockerConfig:
+    image: str            # e.g. "vllm-ascend:v0.9.0"
+    container_name: str   # e.g. "vllm_tuner_serving"
+    shm_size: str = "8g"
+    registry: str = ""    # private registry prefix; empty = no login
+    extra_flags: str = "" # appended verbatim to docker run
+    device_index: int = -1  # Ascend /dev/davinciN; -1 = auto (npu_id*2+chip_id)
+
+
+@dataclass
 class RemoteConfig:
     host: str
     port: int
@@ -84,6 +94,7 @@ class TunerConfig:
     sweep: SweepConfig
     optimization: OptimizationConfig
     save_dir: str
+    docker: DockerConfig = None  # Optional; None = bare-process mode
 
 
 def load_config(path: str) -> TunerConfig:
@@ -120,6 +131,10 @@ def load_config(path: str) -> TunerConfig:
 
     optimization = OptimizationConfig(phase_2a=phase_2a, phase_2b=phase_2b)
 
+    docker_cfg = None
+    if "docker" in raw:
+        docker_cfg = DockerConfig(**raw["docker"])
+
     return TunerConfig(
         remote=remote,
         hardware=hardware,
@@ -129,4 +144,5 @@ def load_config(path: str) -> TunerConfig:
         sweep=sweep,
         optimization=optimization,
         save_dir=raw["save_dir"],
+        docker=docker_cfg,
     )
