@@ -1,3 +1,4 @@
+from __future__ import annotations
 import argparse
 import os
 import sys
@@ -17,33 +18,170 @@ from vllm_tuner.skills import ThroughputSkill, LatencySkill, TaskMetricSkill, Me
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build CLI argument parser with run and deploy subcommands."""
-    raise NotImplementedError
+    parser = argparse.ArgumentParser(prog="vllm-tuner")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run_p = sub.add_parser("run", help="Full optimization pipeline")
+    run_p.add_argument("--config", required=True, help="Path to tuner_config.yaml")
+
+    deploy_p = sub.add_parser("deploy", help="Deploy only (Ship-It)")
+    deploy_p.add_argument("--config", required=True)
+    deploy_p.add_argument("--use-best-config", default=None,
+                          help="Read best infra+gen params from this report file")
+    return parser
 
 
-def _build_skills(cfg, remote, observer) -> list:
-    """Instantiate EvalSkill list from config skill names."""
-    raise NotImplementedError
+def _build_skills(cfg, remote, observer):
+    skill_map = {
+        "throughput": ThroughputSkill(concurrency=4, num_requests=20, input_len=256),
+        "latency": LatencySkill(num_requests=10, input_len=256),
+        "task_metric": TaskMetricSkill(
+            remote=remote,
+            script=cfg.evaluation.script,
+            data_dir=cfg.evaluation.data,
+            sample_size=cfg.evaluation.sample_size,
+            timeout_seconds=cfg.evaluation.timeout_seconds,
+        ),
+        "memory": MemorySkill(observer=observer),
+    }
+    return [skill_map[s] for s in cfg.evaluation.skills if s in skill_map]
 
 
-def _load_best_infra_from_report(report_path: str, save_dir: str) -> dict | None:
-    """Parse best_config.md + results.tsv config_json to reconstruct best infra params."""
-    raise NotImplementedError
+def _load_best_infra_from_report(report_path: str, save_dir: str):
+    """
+    Parse best_config.md to find the 'Best Throughput' config hash,
+    then look it up in results.tsv (config_json column) to get the full param dict.
+    Returns the infra param dict, or None if not found.
+    """
+    import re
+    import csv
+    import json
+    from pathlib import Path
+
+    report = Path(report_path).read_text(encoding="utf-8")
+    m = re.search(r"### \u2462 Best Throughput.*?Config hash: (\w+)", report, re.DOTALL)
+    if not m:
+        return None
+    target_hash = m.group(1)
+
+    tsv_path = Path(save_dir) / "results.tsv"
+    if not tsv_path.exists():
+        return None
+
+    with open(tsv_path, encoding="utf-8") as f:
+        for row in csv.DictReader(f, delimiter="\t"):
+            if row.get("config_hash") == target_hash and row.get("phase") == "2a":
+                config_json = row.get("config_json", "")
+                if config_json and config_json != "-":
+                    try:
+                        return json.loads(config_json)
+                    except json.JSONDecodeError:
+                        pass
+    return None
 
 
 def cmd_run(args):
-    """Execute full 5-phase pipeline: deploy → sweep → 2a → 2b → report."""
-    raise NotImplementedError
+    cfg = load_config(args.config)
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY environment variable not set")
+        sys.exit(1)
+
+    remote = RemoteEnv(cfg.remote)
+    framework = get_framework(cfg.framework, host=cfg.remote.host, port=cfg.remote.vllm_port)
+    observer = get_observer(cfg.hardware.type, remote,
+                            npu_id=cfg.hardware.npu_id, chip_id=cfg.hardware.chip_id)
+    actor = Actor(remote=remote, framework=framework,
+                  work_dir=cfg.remote.working_dir,
+                  host=cfg.remote.host, port=cfg.remote.vllm_port)
+    brain = Brain(api_key=api_key)
+    reporter = Reporter(save_dir=cfg.save_dir)
+    skills = _build_skills(cfg, remote, observer)
+    server_url = framework.get_api_base()
+    runner = Runner(skills=skills, server_url=server_url)
+
+    # Phase 0: Ship-It
+    print("\n─── Phase 0: Ship-It ───")
+    ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg)
+    default_infra = {
+        "block_size": cfg.optimization.phase_2a.parameters["block_size"][0],
+        "gpu_memory_utilization": cfg.optimization.phase_2a.parameters.get(
+            "gpu_memory_utilization", [0.85])[0],
+    }
+    ship.run(default_infra)
+
+    # Phase 1: Sweep
+    print("\n─── Phase 1: Sweep ───")
+    sweep = BenchmarkSweep(
+        server_url=server_url,
+        health_url=framework.get_health_endpoint(),
+        concurrency_levels=cfg.sweep.concurrency_levels,
+        input_lengths=cfg.sweep.input_lengths,
+        requests_per_cell=cfg.sweep.requests_per_cell,
+        request_timeout=cfg.sweep.request_timeout_seconds,
+    )
+    sweep_result = sweep.run()
+    print(f"[Sweep] Best: {sweep_result.get('best_throughput')}")
+
+    # Phase 2a + 2b
+    orch = Orchestrator(
+        config=cfg, actor=actor, brain=brain,
+        runner=runner, reporter=reporter,
+        sweep_result=sweep_result, observer=observer,
+    )
+    print("\n─── Phase 2a: Infra Tuning ───")
+    best_infra = orch.run_phase_2a()
+
+    print("\n─── Phase 2b: Accuracy Tuning ───")
+    orch.run_phase_2b(infra_config=best_infra)
+
+    # Phase 3: Report
+    print("\n─── Phase 3: Report ───")
+    model_name = cfg.model.hf_url.split("/")[-1]
+    report_path = reporter.generate_best_report(
+        model_name=model_name,
+        hardware_name=cfg.hardware.type.upper(),
+        metric_direction=cfg.evaluation.metric_direction,
+    )
+    print(f"[✓] Report saved: {report_path}")
+    print(f"[✓] Service running at http://{cfg.remote.host}:{cfg.remote.vllm_port}")
+    remote.close()
 
 
 def cmd_deploy(args):
-    """Deploy only (Phase 0 Ship-It), optionally loading best config from report."""
-    raise NotImplementedError
+    cfg = load_config(args.config)
+    remote = RemoteEnv(cfg.remote)
+    framework = get_framework(cfg.framework, host=cfg.remote.host, port=cfg.remote.vllm_port)
+    actor = Actor(remote=remote, framework=framework,
+                  work_dir=cfg.remote.working_dir,
+                  host=cfg.remote.host, port=cfg.remote.vllm_port)
+    ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg)
+
+    infra = {
+        "block_size": cfg.optimization.phase_2a.parameters["block_size"][0],
+        "gpu_memory_utilization": cfg.optimization.phase_2a.parameters.get(
+            "gpu_memory_utilization", [0.85])[0],
+    }
+
+    if args.use_best_config:
+        print(f"[Deploy] Loading best config from {args.use_best_config}")
+        best = _load_best_infra_from_report(args.use_best_config, cfg.save_dir)
+        if best:
+            infra.update(best)
+        else:
+            print("[Deploy] Could not parse best infra params; using config defaults.")
+
+    ship.run(infra)
+    remote.close()
 
 
 def main():
-    """CLI entry point."""
-    raise NotImplementedError
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command == "run":
+        cmd_run(args)
+    elif args.command == "deploy":
+        cmd_deploy(args)
 
 
 if __name__ == "__main__":
