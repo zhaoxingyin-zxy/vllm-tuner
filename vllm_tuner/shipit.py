@@ -1,29 +1,37 @@
 # vllm_tuner/shipit.py
 import re
 import time
+from pathlib import Path
 
 
 class ShipIt:
     """Phase 0: Automated deployment agent. Can be used standalone."""
 
-    def __init__(self, remote, actor, framework, config):
+    def __init__(self, remote, actor, framework, config, docker_manager=None):
         self.remote = remote
         self.actor = actor
         self.framework = framework
         self.cfg = config
+        self.docker_manager = docker_manager
 
     def run(self, default_infra_config: dict) -> bool:
         """Full deployment pipeline. Returns True on success."""
         print("[Ship-It] Checking remote environment...")
         env = self.check_remote_env()
-        print(f"[✓] HBM: {env['hbm_total_mb']}MB, Health: {env['health']}")
+        print(f"[OK] HBM: {env['hbm_total_mb']}MB, Health: {env['health']}")
 
         self.auto_fix_env(env)
 
+        if self.docker_manager:
+            if not self.docker_manager.is_container_running():
+                print("[Docker] Starting container...")
+                model_dir = str(Path(self.cfg.model.local_path).parent)
+                self.docker_manager.run_container(model_dir, self.cfg.remote.vllm_port)
+
         if not env["model_exists"]:
-            print(f"[↓] Pulling model {self.cfg.model.hf_url}...")
+            print(f"[Down] Pulling model {self.cfg.model.hf_url}...")
             self.pull_model()
-            print("[✓] Model pull complete")
+            print("[OK] Model pull complete")
 
         print("[...] Starting inference service...")
         self.actor.start_service(self.cfg.model.local_path, default_infra_config)
@@ -42,7 +50,7 @@ class ShipIt:
             else:
                 raise RuntimeError(f"Service fast-fail check failed. Logs:\n{logs}")
 
-        print("[✓] Service healthy and responding")
+        print("[OK] Service healthy and responding")
         return True
 
     def self_heal(
@@ -108,9 +116,12 @@ class ShipIt:
         ).stdout.strip()
         health = health_out.split()[0] if health_out else "UNKNOWN"
 
-        # vLLM installed
-        vllm_check = self.remote.run("python -c 'import vllm'")
-        vllm_installed = vllm_check.returncode == 0
+        # vLLM installed — Docker: check image; bare: import check
+        if self.docker_manager:
+            vllm_installed = self.docker_manager.is_image_present()
+        else:
+            vllm_check = self.remote.run("python -c 'import vllm'")
+            vllm_installed = vllm_check.returncode == 0
 
         # Disk
         df_out = self.remote.run(f"df -h {work_dir}").stdout
@@ -135,14 +146,24 @@ class ShipIt:
         }
 
     def auto_fix_env(self, env: dict):
+        if self.docker_manager:
+            if not env["vllm_installed"]:
+                print("[Fix] Pulling Docker image...")
+                self.docker_manager.pull()
+            if env["port_occupied"]:
+                print(f"[!] Port {self.cfg.remote.vllm_port} occupied, clearing inside container...")
+                self.docker_manager.exec_run(
+                    f"fuser -k {self.cfg.remote.vllm_port}/tcp || true", timeout=10
+                )
+            return
+
+        # Bare-process mode (unchanged)
         if not env["vllm_installed"]:
             print("[Fix] Installing vllm-ascend...")
             self.remote.run("pip install vllm-ascend", timeout=300)
-
         if env["port_occupied"]:
             print(f"[!] Port {self.cfg.remote.vllm_port} occupied, clearing...")
             self._clear_port(self.cfg.remote.vllm_port)
-
         if self.cfg.hardware.type == "ascend":
             self.remote.run(
                 "source /usr/local/Ascend/ascend-toolkit/set_env.sh || true"
