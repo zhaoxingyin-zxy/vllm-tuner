@@ -64,7 +64,7 @@ def test_pull_with_registry_calls_login_first():
     assert login_idx < pull_idx
 
 
-def test_run_container_removes_stale_then_runs(monkeypatch):
+def test_run_container_removes_stale_then_runs():
     mgr, remote = make_mgr()
     # Simulate stale container exists: docker ps -a returns a line
     remote.run.side_effect = [

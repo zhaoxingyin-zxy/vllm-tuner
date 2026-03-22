@@ -94,7 +94,7 @@ class TunerConfig:
     sweep: SweepConfig
     optimization: OptimizationConfig
     save_dir: str
-    docker: DockerConfig = None  # Optional; None = bare-process mode
+    docker: DockerConfig = field(default=None)  # Optional; None = bare-process mode
 
 
 def load_config(path: str) -> TunerConfig:

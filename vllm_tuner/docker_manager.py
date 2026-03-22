@@ -1,6 +1,7 @@
 # vllm_tuner/docker_manager.py
 from __future__ import annotations
 from dataclasses import dataclass
+import re
 
 
 @dataclass
@@ -14,10 +15,25 @@ class ExecResult:
 class DockerManager:
     """Encapsulates all docker CLI operations issued over SSH via RemoteEnv."""
 
+    _SAFE_PATTERN = re.compile(r'^[a-zA-Z0-9_./:@-]+$')
+
     def __init__(self, remote, docker_cfg, hw_cfg):
         self.remote = remote
         self.cfg = docker_cfg
         self.hw = hw_cfg
+        self._validate_config()
+
+    def _validate_config(self):
+        """Reject config values that could inject shell metacharacters."""
+        for field_name, value in [
+            ("container_name", self.cfg.container_name),
+            ("image", self.cfg.image),
+        ]:
+            if not self._SAFE_PATTERN.match(value):
+                raise ValueError(
+                    f"DockerConfig.{field_name} contains unsafe characters: {value!r}. "
+                    "Only alphanumerics, _, ., /, :, @, - are allowed."
+                )
 
     def pull(self):
         """Pull image; run docker login first if registry is set."""
@@ -32,14 +48,18 @@ class DockerManager:
     def is_image_present(self) -> bool:
         """Return True if image already exists locally on the remote host."""
         result = self.remote.run(f"docker images -q {self.cfg.image}", timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError(f"docker images failed: {result.stderr}")
         return bool(result.stdout.strip())
 
     def is_container_running(self) -> bool:
         """Return True if container is currently running."""
         result = self.remote.run(
-            f"docker ps --filter name={self.cfg.container_name} --filter status=running -q",
+            f"docker ps --filter name=^/{self.cfg.container_name}$ --filter status=running -q",
             timeout=15,
         )
+        if result.returncode != 0:
+            raise RuntimeError(f"docker ps failed: {result.stderr}")
         return bool(result.stdout.strip())
 
     def run_container(self, model_host_dir: str, vllm_port: int):
@@ -53,7 +73,9 @@ class DockerManager:
             f"docker ps -a --filter name={self.cfg.container_name} -q", timeout=15
         )
         if stale.stdout.strip():
-            self.remote.run(f"docker rm -f {self.cfg.container_name}", timeout=30)
+            result = self.remote.run(f"docker rm -f {self.cfg.container_name}", timeout=30)
+            if result.returncode != 0:
+                raise RuntimeError(f"docker rm -f failed: {result.stderr}")
 
         cmd = (
             f"docker run -d"
@@ -73,11 +95,12 @@ class DockerManager:
 
     def exec_background(self, cmd: str, log_file: str):
         """Run cmd inside the container as a background process."""
-        # Escape single quotes in cmd before embedding in sh -c '...'
+        # Escape single quotes in cmd and log_file before embedding in sh -c '...'
         safe_cmd = cmd.replace("'", "'\\''")
+        safe_log = log_file.replace("'", "'\\''")
         exec_cmd = (
             f"docker exec {self.cfg.container_name} "
-            f"sh -c 'nohup {safe_cmd} > {log_file} 2>&1 &'"
+            f"sh -c 'nohup {safe_cmd} > {safe_log} 2>&1 &'"
         )
         result = self.remote.run(exec_cmd, timeout=30)
         if result.returncode != 0:
@@ -108,7 +131,7 @@ class DockerManager:
             if self.cfg.device_index >= 0:
                 idx = self.cfg.device_index
             else:
-                idx = self.hw.npu_id * 2 + self.hw.chip_id
+                idx = self.hw.npu_id * 2 + self.hw.chip_id  # dual-die Atlas 300I Duo: 2 dies per card
             return (
                 f"--device /dev/davinci{idx}"
                 f" --device /dev/davinci_manager"
