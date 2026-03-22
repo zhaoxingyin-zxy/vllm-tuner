@@ -28,8 +28,10 @@ class ModelConfig:
     local_path: str = ""
 
     def _set_working_dir(self, working_dir: str):
-        """Derive local_path from hf_url and working_dir if not set."""
-        raise NotImplementedError
+        """Derive local_path from last segment of hf_url under working_dir/models/."""
+        if not self.local_path:
+            model_name = self.hf_url.rstrip("/").split("/")[-1]
+            self.local_path = f"{working_dir}/models/{model_name}"
 
 
 @dataclass
@@ -86,4 +88,45 @@ class TunerConfig:
 
 def load_config(path: str) -> TunerConfig:
     """Load and validate tuner_config.yaml into TunerConfig dataclasses."""
-    raise NotImplementedError
+    with open(path) as f:
+        raw = yaml.safe_load(f)
+
+    remote = RemoteConfig(**raw["remote"])
+    hardware = HardwareConfig(**raw["hardware"])
+    model = ModelConfig(
+        hf_url=raw["model"]["hf_url"],
+        hf_token=raw["model"].get("hf_token", ""),
+        local_path=raw["model"].get("local_path", ""),
+    )
+    model._set_working_dir(remote.working_dir)
+
+    evaluation = EvaluationConfig(**raw["evaluation"])
+    sweep = SweepConfig(**raw["sweep"])
+
+    p2a_raw = raw["optimization"]["phase_2a"]
+    phase_2a = PhaseConfig(
+        max_rounds=p2a_raw["max_rounds"],
+        patience=p2a_raw["patience"],
+        parameters=p2a_raw["parameters"],
+    )
+
+    p2b_raw = raw["optimization"]["phase_2b"]
+    phase_2b = Phase2bConfig(
+        max_rounds=p2b_raw["max_rounds"],
+        patience=p2b_raw["patience"],
+        baseline=p2b_raw["baseline"],
+        parameters=p2b_raw["parameters"],
+    )
+
+    optimization = OptimizationConfig(phase_2a=phase_2a, phase_2b=phase_2b)
+
+    return TunerConfig(
+        remote=remote,
+        hardware=hardware,
+        framework=raw["framework"],
+        model=model,
+        evaluation=evaluation,
+        sweep=sweep,
+        optimization=optimization,
+        save_dir=raw["save_dir"],
+    )
