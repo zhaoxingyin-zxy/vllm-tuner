@@ -9,6 +9,7 @@ from vllm_tuner.frameworks import get_framework
 from vllm_tuner.hardware import get_observer
 from vllm_tuner.actor import Actor
 from vllm_tuner.shipit import ShipIt
+from vllm_tuner.docker_manager import DockerManager
 from vllm_tuner.sweep import BenchmarkSweep
 from vllm_tuner.brain import Brain
 from vllm_tuner.runner import Runner
@@ -97,78 +98,96 @@ def cmd_run(args):
     framework = get_framework(cfg.framework, host=cfg.remote.host, port=cfg.remote.vllm_port)
     observer = get_observer(cfg.hardware.type, remote,
                             npu_id=cfg.hardware.npu_id, chip_id=cfg.hardware.chip_id)
+
+    docker_mgr = None
+    if cfg.docker:
+        docker_mgr = DockerManager(remote, cfg.docker, cfg.hardware)
+
     actor = Actor(remote=remote, framework=framework,
                   work_dir=cfg.remote.working_dir,
-                  host=cfg.remote.host, port=cfg.remote.vllm_port)
+                  host=cfg.remote.host, port=cfg.remote.vllm_port,
+                  docker_manager=docker_mgr)
     brain = Brain(api_key=api_key)
     reporter = Reporter(save_dir=cfg.save_dir)
 
-    if server_url is None:
-        # Phase 0: Ship-It
-        print("\n─── Phase 0: Ship-It ───")
-        ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg)
-        default_infra = {
-            "block_size": cfg.optimization.phase_2a.parameters["block_size"][0],
-            "gpu_memory_utilization": cfg.optimization.phase_2a.parameters.get(
-                "gpu_memory_utilization", [0.85])[0],
-        }
-        ship.run(default_infra)
+    try:
+        if server_url is None:
+            # Phase 0: Ship-It
+            print("\n─── Phase 0: Ship-It ───")
+            ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg,
+                          docker_manager=docker_mgr)
+            default_infra = {
+                "block_size": cfg.optimization.phase_2a.parameters["block_size"][0],
+                "gpu_memory_utilization": cfg.optimization.phase_2a.parameters.get(
+                    "gpu_memory_utilization", [0.85])[0],
+            }
+            ship.run(default_infra)
 
-        # Phase 1: Sweep
-        print("\n─── Phase 1: Sweep ───")
-        api_base = framework.get_api_base()
-        sweep = BenchmarkSweep(
-            server_url=api_base,
-            health_url=framework.get_health_endpoint(),
-            concurrency_levels=cfg.sweep.concurrency_levels,
-            input_lengths=cfg.sweep.input_lengths,
-            requests_per_cell=cfg.sweep.requests_per_cell,
-            request_timeout=cfg.sweep.request_timeout_seconds,
+            # Phase 1: Sweep
+            print("\n─── Phase 1: Sweep ───")
+            api_base = framework.get_api_base()
+            sweep = BenchmarkSweep(
+                server_url=api_base,
+                health_url=framework.get_health_endpoint(),
+                concurrency_levels=cfg.sweep.concurrency_levels,
+                input_lengths=cfg.sweep.input_lengths,
+                requests_per_cell=cfg.sweep.requests_per_cell,
+                request_timeout=cfg.sweep.request_timeout_seconds,
+            )
+            sweep_result = sweep.run()
+            print(f"[Sweep] Best: {sweep_result.get('best_throughput')}")
+            server_url = api_base
+        else:
+            print(f"\n[--server-url] Skipping Phase 0 (deploy) and Phase 1 (sweep).")
+            print(f"[--server-url] Using pre-deployed server: {server_url}")
+            sweep_result = {}
+
+        skills = _build_skills(cfg, remote, observer)
+        runner = Runner(skills=skills, server_url=server_url)
+
+        # Phase 2a + 2b
+        orch = Orchestrator(
+            config=cfg, actor=actor, brain=brain,
+            runner=runner, reporter=reporter,
+            sweep_result=sweep_result, observer=observer,
         )
-        sweep_result = sweep.run()
-        print(f"[Sweep] Best: {sweep_result.get('best_throughput')}")
-        server_url = api_base
-    else:
-        print(f"\n[--server-url] Skipping Phase 0 (deploy) and Phase 1 (sweep).")
-        print(f"[--server-url] Using pre-deployed server: {server_url}")
-        sweep_result = {}
+        print("\n─── Phase 2a: Infra Tuning ───")
+        best_infra = orch.run_phase_2a()
 
-    skills = _build_skills(cfg, remote, observer)
-    runner = Runner(skills=skills, server_url=server_url)
+        print("\n─── Phase 2b: Accuracy Tuning ───")
+        orch.run_phase_2b(infra_config=best_infra)
 
-    # Phase 2a + 2b
-    orch = Orchestrator(
-        config=cfg, actor=actor, brain=brain,
-        runner=runner, reporter=reporter,
-        sweep_result=sweep_result, observer=observer,
-    )
-    print("\n─── Phase 2a: Infra Tuning ───")
-    best_infra = orch.run_phase_2a()
-
-    print("\n─── Phase 2b: Accuracy Tuning ───")
-    orch.run_phase_2b(infra_config=best_infra)
-
-    # Phase 3: Report
-    print("\n─── Phase 3: Report ───")
-    model_name = cfg.model.hf_url.split("/")[-1]
-    report_path = reporter.generate_best_report(
-        model_name=model_name,
-        hardware_name=cfg.hardware.type.upper(),
-        metric_direction=cfg.evaluation.metric_direction,
-    )
-    print(f"[✓] Report saved: {report_path}")
-    print(f"[✓] Service: {server_url}")
-    remote.close()
+        # Phase 3: Report
+        print("\n─── Phase 3: Report ───")
+        model_name = cfg.model.hf_url.split("/")[-1]
+        report_path = reporter.generate_best_report(
+            model_name=model_name,
+            hardware_name=cfg.hardware.type.upper(),
+            metric_direction=cfg.evaluation.metric_direction,
+        )
+        print(f"[✓] Report saved: {report_path}")
+        print(f"[✓] Service: {server_url}")
+    finally:
+        if docker_mgr:
+            docker_mgr.stop_container()
+        remote.close()
 
 
 def cmd_deploy(args):
     cfg = load_config(args.config)
     remote = RemoteEnv(cfg.remote)
     framework = get_framework(cfg.framework, host=cfg.remote.host, port=cfg.remote.vllm_port)
+
+    docker_mgr = None
+    if cfg.docker:
+        docker_mgr = DockerManager(remote, cfg.docker, cfg.hardware)
+
     actor = Actor(remote=remote, framework=framework,
                   work_dir=cfg.remote.working_dir,
-                  host=cfg.remote.host, port=cfg.remote.vllm_port)
-    ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg)
+                  host=cfg.remote.host, port=cfg.remote.vllm_port,
+                  docker_manager=docker_mgr)
+    ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg,
+                  docker_manager=docker_mgr)
 
     infra = {
         "block_size": cfg.optimization.phase_2a.parameters["block_size"][0],
@@ -184,8 +203,12 @@ def cmd_deploy(args):
         else:
             print("[Deploy] Could not parse best infra params; using config defaults.")
 
-    ship.run(infra)
-    remote.close()
+    try:
+        ship.run(infra)
+    finally:
+        if docker_mgr:
+            docker_mgr.stop_container()
+        remote.close()
 
 
 def main():
