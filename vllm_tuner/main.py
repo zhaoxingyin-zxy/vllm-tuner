@@ -23,6 +23,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_p = sub.add_parser("run", help="Full optimization pipeline")
     run_p.add_argument("--config", required=True, help="Path to tuner_config.yaml")
+    run_p.add_argument(
+        "--server-url", default=None,
+        help="Skip Phase 0 (deploy) and Phase 1 (sweep). Use this pre-deployed server URL directly.",
+    )
 
     deploy_p = sub.add_parser("deploy", help="Deploy only (Ship-It)")
     deploy_p.add_argument("--config", required=True)
@@ -87,6 +91,8 @@ def cmd_run(args):
         print("ERROR: ANTHROPIC_API_KEY environment variable not set")
         sys.exit(1)
 
+    server_url = args.server_url  # None means full pipeline; set means skip Phase 0+1
+
     remote = RemoteEnv(cfg.remote)
     framework = get_framework(cfg.framework, host=cfg.remote.host, port=cfg.remote.vllm_port)
     observer = get_observer(cfg.hardware.type, remote,
@@ -96,32 +102,39 @@ def cmd_run(args):
                   host=cfg.remote.host, port=cfg.remote.vllm_port)
     brain = Brain(api_key=api_key)
     reporter = Reporter(save_dir=cfg.save_dir)
+
+    if server_url is None:
+        # Phase 0: Ship-It
+        print("\n─── Phase 0: Ship-It ───")
+        ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg)
+        default_infra = {
+            "block_size": cfg.optimization.phase_2a.parameters["block_size"][0],
+            "gpu_memory_utilization": cfg.optimization.phase_2a.parameters.get(
+                "gpu_memory_utilization", [0.85])[0],
+        }
+        ship.run(default_infra)
+
+        # Phase 1: Sweep
+        print("\n─── Phase 1: Sweep ───")
+        api_base = framework.get_api_base()
+        sweep = BenchmarkSweep(
+            server_url=api_base,
+            health_url=framework.get_health_endpoint(),
+            concurrency_levels=cfg.sweep.concurrency_levels,
+            input_lengths=cfg.sweep.input_lengths,
+            requests_per_cell=cfg.sweep.requests_per_cell,
+            request_timeout=cfg.sweep.request_timeout_seconds,
+        )
+        sweep_result = sweep.run()
+        print(f"[Sweep] Best: {sweep_result.get('best_throughput')}")
+        server_url = api_base
+    else:
+        print(f"\n[--server-url] Skipping Phase 0 (deploy) and Phase 1 (sweep).")
+        print(f"[--server-url] Using pre-deployed server: {server_url}")
+        sweep_result = {}
+
     skills = _build_skills(cfg, remote, observer)
-    server_url = framework.get_api_base()
     runner = Runner(skills=skills, server_url=server_url)
-
-    # Phase 0: Ship-It
-    print("\n─── Phase 0: Ship-It ───")
-    ship = ShipIt(remote=remote, actor=actor, framework=framework, config=cfg)
-    default_infra = {
-        "block_size": cfg.optimization.phase_2a.parameters["block_size"][0],
-        "gpu_memory_utilization": cfg.optimization.phase_2a.parameters.get(
-            "gpu_memory_utilization", [0.85])[0],
-    }
-    ship.run(default_infra)
-
-    # Phase 1: Sweep
-    print("\n─── Phase 1: Sweep ───")
-    sweep = BenchmarkSweep(
-        server_url=server_url,
-        health_url=framework.get_health_endpoint(),
-        concurrency_levels=cfg.sweep.concurrency_levels,
-        input_lengths=cfg.sweep.input_lengths,
-        requests_per_cell=cfg.sweep.requests_per_cell,
-        request_timeout=cfg.sweep.request_timeout_seconds,
-    )
-    sweep_result = sweep.run()
-    print(f"[Sweep] Best: {sweep_result.get('best_throughput')}")
 
     # Phase 2a + 2b
     orch = Orchestrator(
@@ -144,7 +157,7 @@ def cmd_run(args):
         metric_direction=cfg.evaluation.metric_direction,
     )
     print(f"[✓] Report saved: {report_path}")
-    print(f"[✓] Service running at http://{cfg.remote.host}:{cfg.remote.vllm_port}")
+    print(f"[✓] Service: {server_url}")
     remote.close()
 
 

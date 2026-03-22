@@ -79,5 +79,67 @@ class Reporter:
         hardware_name: str,
         metric_direction: str,
     ) -> str:
-        """Generate best_config.md with best latency, throughput, accuracy, Pareto rec."""
-        raise NotImplementedError
+        """Generate best_config.md. Returns path to written file."""
+        from vllm_tuner.analysis import get_pareto_frontier, select_bests
+        rows = self.load_all()
+        bests = select_bests(rows)
+        frontier = get_pareto_frontier(rows, metric_direction)
+
+        lines = [
+            "# vLLM-Tuner Optimization Report",
+            f"## Model: {model_name} | Hardware: {hardware_name}",
+            "",
+        ]
+
+        b_lat = bests.get("best_latency")
+        b_tps = bests.get("best_throughput")
+        if b_lat:
+            lines += [
+                f"### Best Latency (Round {b_lat['round']})",
+                f"Config hash: {b_lat['config_hash']}",
+                f"P99 latency: {b_lat['latency_p99']}ms",
+                f"Config: {b_lat.get('config_json', '-')}",
+                "",
+            ]
+        if b_tps:
+            lines += [
+                f"### Best Throughput (Round {b_tps['round']})",
+                f"Config hash: {b_tps['config_hash']}",
+                f"Throughput: {b_tps['throughput']} tok/s",
+                f"Config: {b_tps.get('config_json', '-')}",
+                "",
+            ]
+
+        phase2b = [
+            r for r in rows
+            if r.get("phase") == "2b" and r.get("status") == "KEEP"
+            and r.get("task_metric") not in (None, "-")
+        ]
+        if phase2b:
+            best_acc = (max if metric_direction == "maximize" else min)(
+                phase2b, key=lambda r: float(r["task_metric"])
+            )
+            lines += [
+                f"### Best Accuracy (Round {best_acc['round']})",
+                f"Config hash: {best_acc['config_hash']}",
+                f"Task metric: {best_acc['task_metric']}",
+                f"Config: {best_acc.get('config_json', '-')}",
+                "",
+            ]
+
+        if frontier:
+            rec = frontier[0]
+            lines += [
+                "### Pareto Recommendation",
+                f"Round {rec['round']}: throughput={rec['throughput']:.0f} tok/s, "
+                f"metric={rec['task_metric']:.4f}",
+                f"Config: {rec.get('config_json', '-')}",
+                "",
+            ]
+
+        if not b_lat and not b_tps and not phase2b:
+            lines += ["(No results to report yet.)", ""]
+
+        report_path = self.save_dir / "best_config.md"
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        return str(report_path)
