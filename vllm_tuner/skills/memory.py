@@ -7,8 +7,8 @@ class MemorySkill(EvalSkill):
     name = "memory"
 
     def __init__(self, observer):
-        pass
+        self.observer = observer
 
     def measure(self, server_url: str, gen_params: dict) -> float:
         """Return HBM utilization percent."""
-        raise NotImplementedError
+        return self.observer.get_stats().hbm_util_pct

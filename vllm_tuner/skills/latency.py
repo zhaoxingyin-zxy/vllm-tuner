@@ -10,8 +10,21 @@ class LatencySkill(EvalSkill):
     name = "latency"
 
     def __init__(self, num_requests: int = 10, input_len: int = 256):
-        pass
+        self.num_requests = num_requests
+        self.input_len = input_len
 
     def measure(self, server_url: str, gen_params: dict) -> dict:
         """Return dict with p50_ms and p99_ms."""
-        raise NotImplementedError
+        prompt = "x " * self.input_len
+        payload = {"model": "default", "messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": 64, **gen_params}
+        latencies = []
+        for _ in range(self.num_requests):
+            start = time.time()
+            requests.post(f"{server_url}/chat/completions", json=payload, timeout=60)
+            latencies.append((time.time() - start) * 1000)
+        latencies.sort()
+        return {
+            "p50_ms": statistics.median(latencies),
+            "p99_ms": latencies[int(len(latencies) * 0.99)] if len(latencies) > 1 else latencies[-1],
+        }
